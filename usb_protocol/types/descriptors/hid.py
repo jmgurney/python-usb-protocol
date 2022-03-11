@@ -7,12 +7,21 @@ import unittest
 from enum import IntEnum, unique
 
 import construct
-from   construct  import this, Default
+from   construct  import this, IfThenElse, Default, GreedyRange
+from   construct  import Probe
 
 from .. import LanguageIDs
 from ..descriptor import \
     DescriptorField, DescriptorNumber, DescriptorFormat, \
     BCDFieldAdapter, DescriptorLength
+
+__all__ = [
+	'HIDPrefix',
+	'HIDDescriptor',
+	'ReportDescriptor',
+	'ReportDescriptorItem',
+	'ItemFlags',
+]
 
 @unique
 class HIDPrefix(IntEnum):
@@ -53,33 +62,185 @@ HIDDescriptor = DescriptorFormat(
     "bcdHID"              / DescriptorField("HID Protocol Version", default=1.11),
     "bCountryCode"        / DescriptorField("HID Device Language", default=0),
     "bNumDescriptors"     / DescriptorField("Number of HID Descriptors", default=1),
-    "bDescriptorType"     / DescriptorField("HID Descriptor Type", default=34),
+    "bRepDescriptorType"  / DescriptorField("HID Descriptor Type", default=34),
     "wDescriptorLength"   / DescriptorField("HID Descriptor Length")
     # bDescriptorType and wDescriptorLength repeat bNumDescriptors times
-)
-
-_hid_item_length = [ 0, 1, 2, 4 ]
-ReportDescriptor = DescriptorFormat(
-    "bHeader" / construct.BitStruct(
-        # prefix technically consists of a 4 byte tag and a 2 byte type,
-        # however, they're all listed together in the HID spec
-        "prefix"  / construct.Enum(construct.BitsInteger(6), HIDPrefix),
-        "bSize"   / construct.BitsInteger(2),
-    ),
-    "data"    / construct.Byte[lambda ctx: _hid_item_length[ctx.bHeader.bSize]]
 )
 
 # Flags for INPUT/OUTPUT/FEATURE items. Named under one of the following conventions:
 # valA_valB: valA when 0, valB when 1
 # flag:      Flag disabled when 0, flag enabled when 1
 # nFlag:     Flag enabled when 0, flag disabled when 1
-ItemFlags = construct.BitStruct(
+ItemFlags2 = construct.BitStruct(
+    "reserved6" / construct.Flag,
+    "reserved5" / construct.Flag,
+    "reserved4" / construct.Flag,
+    "reserved3" / construct.Flag,
+    "reserved2" / construct.Flag,
+    "reserved1" / construct.Flag,
+    "reserved0" / construct.Flag,
+    "bitfield_bufferedbytes" / construct.Flag,
     "volatile"          / construct.Flag,
     "null"              / construct.Flag,
     "nPreferred"        / construct.Flag,
-    "linear"            / construct.Flag,
+    "nLinear"           / construct.Flag,
     "wrap"              / construct.Flag,
     "absolute_relative" / construct.Flag,
     "array_variable"    / construct.Flag,
     "data_constant"     / construct.Flag,
 )
+ItemFlags1 = construct.BitStruct(
+    "volatile"          / construct.Flag,
+    "null"              / construct.Flag,
+    "nPreferred"        / construct.Flag,
+    "nLinear"           / construct.Flag,
+    "wrap"              / construct.Flag,
+    "absolute_relative" / construct.Flag,
+    "array_variable"    / construct.Flag,
+    "data_constant"     / construct.Flag,
+)
+_hid_item_flags = dict(enumerate([ construct.Byte[0], ItemFlags1, ItemFlags2, construct.Byte[4] ]))
+ItemFlags = construct.Switch(this.bHeader.bSize, _hid_item_flags)
+
+def HasItemFlags(ctx):
+	# Cannot use in w/ this inline, known issue.
+	v = ctx.bHeader.prefix
+	print(type(v))
+	if not isinstance(v, HIDPrefix):
+		v = v.intvalue
+	return v in { HIDPrefix.INPUT, HIDPrefix.OUTPUT, HIDPrefix.FEATURE }
+
+_hid_item_length = [ 0, 1, 2, 4 ]
+ReportDescriptorItem = DescriptorFormat(
+    "bHeader" / construct.BitStruct(
+        # prefix technically consists of a 4 byte tag and a 2 byte type,
+        # however, they're all listed together in the HID spec
+        "prefix"  / construct.Enum(construct.BitsInteger(6), HIDPrefix),
+        "bSize"   / construct.BitsInteger(2),
+    ),
+    "data"    / IfThenElse(HasItemFlags, ItemFlags, construct.Byte[lambda ctx: _hid_item_length[ctx.bHeader.bSize]]),
+)
+ReportDescriptor = GreedyRange(ReportDescriptorItem)
+
+import unittest
+
+class TestHIDDescriptor(unittest.TestCase):
+	def test_bitstruct(self):
+		rditem = ReportDescriptor.parse(b'\x81\x02')
+
+		self.assertEqual(len(rditem), 1)
+
+		ifs = rditem[0].data
+
+		self.assertEqual(ifs.volatile, False)
+		self.assertEqual(ifs.null, False)
+		self.assertEqual(ifs.nPreferred, False)
+		self.assertEqual(ifs.nLinear, False)
+		self.assertEqual(ifs.wrap, False)
+		self.assertEqual(ifs.absolute_relative, False)
+		self.assertEqual(ifs.array_variable, True)
+		self.assertEqual(ifs.data_constant, False)
+
+		rditem = ReportDescriptor.parse(b'\x82\x01\x02')
+
+		self.assertEqual(len(rditem), 1)
+
+		ifs = rditem[0].data
+
+		self.assertEqual(ifs.bitfield_bufferedbytes, True)
+		self.assertEqual(ifs.volatile, False)
+		self.assertEqual(ifs.null, False)
+		self.assertEqual(ifs.nPreferred, False)
+		self.assertEqual(ifs.nLinear, False)
+		self.assertEqual(ifs.wrap, False)
+		self.assertEqual(ifs.absolute_relative, False)
+		self.assertEqual(ifs.array_variable, True)
+		self.assertEqual(ifs.data_constant, False)
+
+		construct.setGlobalPrintFullStrings(True)
+
+		rditem = ReportDescriptor.parse(b'\x95\x08')
+
+		self.assertEqual(len(rditem), 1)
+
+		it = rditem[0]
+
+		self.assertEqual(it.bHeader.prefix.intvalue, HIDPrefix.REPORT_COUNT)
+		self.assertEqual(it.data, [8])
+
+	def test_hid_desc(self):
+		# sample from USB HID E.4
+		hid_descriptor = bytes([
+			0x09,
+			0x21,
+			0x11, 0x01,
+			0x00,
+			0x01,
+			0x22,
+			0x3f, 0x00,
+		])
+
+		parsed = HIDDescriptor.parse(hid_descriptor)
+
+		self.assertEqual(parsed.bLength, 9)
+		self.assertEqual(parsed.bDescriptorType, 0x21)
+		self.assertEqual(parsed.bcdHID, 1.11)
+		self.assertEqual(parsed.bCountryCode, 0x00)
+		self.assertEqual(parsed.bNumDescriptors, 0x01)
+		self.assertEqual(parsed.bRepDescriptorType, 0x22)
+		self.assertEqual(parsed.wDescriptorLength, 0x3f)
+
+	def test_report_desc(self):
+		# sample from USB HID E.6
+		report_descriptor = bytes([
+			0x05, 0x01,
+			0x09, 0x06,
+			0xa1, 0x01,
+			0x05, 0x07,
+			0x19, 0xe0,
+			0x29, 0xe7,
+			0x15, 0x00,
+			0x25, 0x01,
+			0x75, 0x01,
+			0x95, 0x08,
+			0x81, 0x02,
+			0x95, 0x01,
+			0x75, 0x08,
+			0x81, 0x01,
+			0x95, 0x05,
+			0x75, 0x01,
+			0x05, 0x08,
+			0x19, 0x01,
+			0x29, 0x05,
+			0x91, 0x02,
+			0x95, 0x01,
+			0x75, 0x03,
+			0x91, 0x01,
+			0x95, 0x06,
+			0x75, 0x08,
+			0x15, 0x00,
+			0x25, 0x65,
+			0x05, 0x07,
+			0x19, 0x00,
+			0x29, 0x65,
+			0x81, 0x00,
+			0xc0,
+		])
+
+		parsed = ReportDescriptor.parse(report_descriptor)
+
+		#print(repr(parsed))
+
+		self.assertEqual(len(parsed), 32)
+
+		self.assertEqual(parsed[0].bHeader.prefix.intvalue, HIDPrefix.USAGE_PAGE)
+		self.assertEqual(parsed[5].bHeader.prefix.intvalue, HIDPrefix.USAGE_MAX)
+		self.assertEqual(parsed[5].data, [ 231 ])
+		self.assertEqual(parsed[9].data, [ 8 ])
+		self.assertEqual(parsed[10].bHeader.prefix.intvalue, HIDPrefix.INPUT)
+		self.assertEqual(parsed[10].data.data_constant, False)
+		self.assertEqual(parsed[10].data.array_variable, True)
+		self.assertEqual(parsed[10].data.absolute_relative, False)
+		self.assertEqual(parsed[-1].bHeader.prefix.intvalue, HIDPrefix.END_COLLECTION)
+
+		#print(repr(parsed))
